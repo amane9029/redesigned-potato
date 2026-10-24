@@ -1,0 +1,186 @@
+/**
+ * Razorpay Order Creation Endpoint
+ * POST /api/v1/payments/razorpay/orders
+ * Traceability: PondFish API Spec (Section 29) & Core Engines Spec (Section 19)
+ * Server-authoritative order creation with transparent credentials boundary.
+ */
+
+import { NextResponse } from 'next/server';
+const customerEngine = require('../../../../../../lib/engines/customer');
+const paymentEngine = require('../../../../../../lib/engines/payment');
+const bookingEngine = require('../../../../../../lib/engines/booking');
+const checkoutIntentRepository = require('../../../../../../lib/db/repositories/checkoutIntentRepository');
+
+export const dynamic = 'force-dynamic';
+
+function authenticateRequest(request) {
+  const authHeader = request.headers.get('authorization') || '';
+  if (!authHeader.startsWith('Bearer ')) {
+    const err = new Error('MISSING_BEARER_TOKEN');
+    err.code = 'UNAUTHORIZED';
+    throw err;
+  }
+  const token = authHeader.substring(7).trim();
+  try {
+    return customerEngine.verifySessionToken(token);
+  } catch {
+    const err = new Error('INVALID_SESSION_TOKEN');
+    err.code = 'UNAUTHORIZED';
+    throw err;
+  }
+}
+
+export async function POST(request) {
+  try {
+    const session = authenticateRequest(request);
+    const body = await request.json().catch(() => ({}));
+    const billId = body?.billId || body?.bill_id;
+
+    let authoritativeAmount = 0;
+    const notes = { customerId: session.customerId };
+    let preview = null;
+
+    if (billId) {
+      // Physical Bill Purchase (Slice 10)
+      const { calculatePhysicalBillPreview } = require('../../../../../../lib/engines/billing-correction');
+      preview = await calculatePhysicalBillPreview({
+        billId,
+        customerId: session.customerId,
+        items: body?.items || [],
+      });
+      authoritativeAmount = preview.payment.finalPayable;
+      notes.billId = billId;
+      notes.billNumber = preview.billNumber;
+      notes.type = 'BILL_PURCHASE';
+    } else {
+      // Online Cart Booking (Slice 4)
+      preview = await bookingEngine.previewCheckout(session.customerId);
+      authoritativeAmount = preview.summary.finalPayableAmount;
+      notes.type = 'BOOKING';
+      notes.itemCount = String(preview.items?.length || 0);
+      notes.totalCartAmount = String(preview.summary?.totalCartAmount || preview.summary?.subtotal || 0);
+      notes.subscriptionDiscount = String(preview.summary?.subscriptionCreditUsed || 0);
+      notes.finalPayableAmount = String(preview.summary?.finalPayableAmount || 0);
+    }
+
+    if (authoritativeAmount <= 0) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: {
+            code: 'NO_PAYMENT_REQUIRED',
+            message: 'Your order is fully covered by your active subscription. No online payment is required.',
+          },
+        },
+        { status: 400 }
+      );
+    }
+
+    if (!paymentEngine.isRazorpayConfigured()) {
+      return NextResponse.json(
+        {
+          success: false,
+          configured: false,
+          error: {
+            code: 'PAYMENT_GATEWAY_NOT_CONFIGURED',
+            message: 'Genuine Razorpay credentials are not configured in this server environment. Payment cannot be processed.',
+            amount: authoritativeAmount,
+          },
+        },
+        { status: 503 }
+      );
+    }
+
+    const order = await paymentEngine.createRazorpayOrder({
+      amount: authoritativeAmount,
+      currency: 'INR',
+      receipt: `rcpt_${Date.now()}`,
+      notes,
+    });
+
+    const orderId = order?.orderId || order?.id;
+    if (!orderId || typeof orderId !== 'string' || !orderId.trim()) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: {
+            code: 'RAZORPAY_ORDER_CREATION_FAILED',
+            message: 'Payment gateway did not return a valid order ID. Checkout initialization failed.',
+          },
+        },
+        { status: 502 }
+      );
+    }
+
+    // Durable Checkout Intent Persistence (Phase 2J-K)
+    // Persist immutable snapshot before initiating Razorpay payment
+    try {
+      await checkoutIntentRepository.createIntent({
+        razorpayOrderId: orderId.trim(),
+        customerId: session.customerId,
+        cartSnapshot: billId ? (body?.items || []) : (preview?.items || []),
+        subscriptionSnapshot: preview?.subscription || null,
+        feeBreakdown: preview?.summary || { finalPayableAmount: authoritativeAmount },
+        amountPaise: Math.round(authoritativeAmount * 100),
+        currency: 'INR',
+        status: 'CREATED',
+      });
+    } catch (intentErr) {
+      console.error('[CHECKOUT INTENT PERSISTENCE ERROR]', intentErr.message);
+      return NextResponse.json(
+        {
+          success: false,
+          error: {
+            code: 'CHECKOUT_INTENT_PERSISTENCE_FAILED',
+            message: 'Failed to securely persist checkout intent snapshot. Order creation cannot proceed.',
+          },
+        },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({
+      success: true,
+      data: order,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    if (error.code === 'UNAUTHORIZED') {
+      return NextResponse.json(
+        {
+          success: false,
+          error: {
+            code: 'UNAUTHORIZED',
+            message: 'A valid customer authentication session is required.',
+          },
+        },
+        { status: 401 }
+      );
+    }
+
+    if (error.code === 'EMPTY_CART') {
+      return NextResponse.json(
+        {
+          success: false,
+          error: {
+            code: 'EMPTY_CART',
+            message: error.message,
+          },
+        },
+        { status: 400 }
+      );
+    }
+
+    console.error('[API ERROR] POST /api/v1/payments/razorpay/orders:', error.message);
+    return NextResponse.json(
+      {
+        success: false,
+        error: {
+          code: 'RAZORPAY_ORDER_FAILED',
+          message: error.message || 'Unable to create payment order at this time.',
+        },
+      },
+      { status: 500 }
+    );
+  }
+}
